@@ -1,0 +1,123 @@
+name: Sync Chromium APK
+
+on:
+  schedule:
+    - cron: '0 8 * * *' # 每天早上 8 点运行
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE20: true
+  # 请把下方地址改为您部署的那个 Chromium 专门脚本的 Worker 域名（确保能访问到 /json）
+  CHROMIUM_WORKER_URL: "https://你的chromium解析worker.workers.dev/json"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aapt unzip curl
+
+      - name: Fetch Latest Chromium Metadata
+        id: meta
+        run: |
+          echo "🌐 获取 Chromium 最新元数据..."
+          RESPONSE=$(curl -s "$CHROMIUM_WORKER_URL")
+          
+          # 从 JSON 中提取版本号和下载链接
+          VERSION=$(echo "$RESPONSE" | jq -r '.version')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.apkUrl')
+          
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "❌ 无法从 Worker 获取有效的版本号"
+            exit 1
+          fi
+          
+          echo "Latest Version: $VERSION"
+          echo "Download URL: $DOWNLOAD_URL"
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+
+      - name: Check if version already released
+        id: check_release
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          if gh release view "v${VERSION}" --repo ${{ github.repository }} &>/dev/null; then
+            echo "⏭️ 版本 ${VERSION} 已存在，跳过后续步骤"
+            echo "should_upload=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ 发现新版本 ${VERSION}，准备下载"
+            echo "should_upload=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GH_UPLOAD_TOKEN }}
+
+      - name: Download and Process Chromium ZIP
+        if: steps.check_release.outputs.should_upload == 'true'
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          URL="${{ steps.meta.outputs.download_url }}"
+          
+          echo "⬇️ 开始下载 Chromium zip..."
+          curl -L -o chromium.zip "$URL"
+          
+          echo "📦 解压 zip 文件..."
+          unzip -q chromium.zip
+          
+          # Chromium 解压后通常会生成一个叫 android_arm64 或 chrome-android 的目录
+          # 我们在其中寻找主要的 APK 文件（通常叫 ChromePublic.apk 或 Chromium.apk）
+          APK_PATH=$(find . -name "*.apk" | head -n 1)
+          
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ 在解压后的文件中没有找到任何 APK！"
+            exit 1
+          fi
+          
+          echo "✅ 找到 APK 文件: $APK_PATH"
+          mv "$APK_PATH" "chromium-${VERSION}.apk"
+          
+          FILE_SIZE=$(stat -c%s "chromium-${VERSION}.apk" 2>/dev/null || echo 0)
+          echo "✅ 最终 APK 大小：${FILE_SIZE} 字节"
+
+      - name: Upload APK to Github Release
+        if: steps.check_release.outputs.should_upload == 'true'
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          echo "📦 创建 Release: v${VERSION}"
+          gh release create "v${VERSION}" "chromium-${VERSION}.apk" \
+            --title "Chromium ${VERSION}" \
+            --notes "自动同步 Chromium 最新快照 - 版本号: ${VERSION}"
+          echo "✅ Release 创建成功"
+        env:
+          GH_TOKEN: ${{ secrets.GH_UPLOAD_TOKEN }}
+
+      - name: Clean old releases (keep latest 3)
+        env:
+          GH_TOKEN: ${{ secrets.GH_UPLOAD_TOKEN }}
+        run: |
+          echo "🧹 检查是否需要清理旧版本..."
+          ALL_TAGS=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+          TOTAL=$(echo "$ALL_TAGS" | wc -l)
+          
+          if [ "$TOTAL" -gt 3 ]; then
+            KEEP=3
+            DELETE_COUNT=$((TOTAL - KEEP))
+            echo "⚠️ 将删除 ${DELETE_COUNT} 个旧版本，保留最新 ${KEEP} 个"
+            OLD_TAGS=$(echo "$ALL_TAGS" | tail -n +$((KEEP + 1)))
+            for TAG in $OLD_TAGS; do
+              echo "🗑️ 删除旧版本: $TAG"
+              gh release delete "$TAG" --yes --cleanup-tag || echo "删除 $TAG 失败，继续下一个"
+            done
+            echo "✅ 清理完成"
+          else
+            echo "✅ 版本数量未超过 3 个，无需清理"
+          fi
