@@ -22,21 +22,28 @@ jobs:
       - name: Install Tools
         run: |
           sudo apt-get update -qq
-          # 确保安装了 aapt 用来解析 APK 的内部版本号
           sudo apt-get install -y -qq unzip curl aapt
 
-      - name: Get Latest Build Number from GCS
+      - name: Get Latest Build Number from Official API
         id: chromium_build
         run: |
-          echo "🌐 查询 Google GCS 的最新 Android_Arm64 构建号..."
-          XML_DATA=$(curl -s "https://storage.googleapis.com/chromium-browser-snapshots/?prefix=Android_Arm64/&delimiter=/&max-keys=1000")
-          LATEST_BUILD=$(echo "$XML_DATA" | grep -oE 'Android_Arm64/[0-9]+/' | grep -oE '[0-9]+' | sort -n | tail -n 1)
+          echo "🌐 正在从 Chromium 官方解析服务获取最新 Android_Arm64 构建号..."
+          
+          # 直接向官方查询最新的准确构建号 (规避 GCS XML 分页坑)
+          LATEST_BUILD=$(curl -s "https://download-chromium.appspot.com/rev/Android_Arm64")
+          
+          # 验证是否为纯数字
+          if [[ ! "$LATEST_BUILD" =~ ^[0-9]+$ ]]; then
+            echo "❌ 接口返回的构建号异常: $LATEST_BUILD ，尝试从备用 API 获取..."
+            LATEST_BUILD=$(curl -s "https://www.googleapis.com/download/storage/v1/b/chromium-browser-snapshots/o/Android_Arm64%2FLAST_CHANGE?alt=media")
+          fi
           
           if [ -z "$LATEST_BUILD" ]; then
-            echo "❌ 无法解析到有效的构建号！"
+            echo "❌ 无法获取有效的最新构建号！"
             exit 1
           fi
-          echo "🔥 最新构建号为: $LATEST_BUILD"
+          
+          echo "🔥 成功获取最新构建号: $LATEST_BUILD (预计对应 151+ 版本)"
           echo "build_num=$LATEST_BUILD" >> $GITHUB_OUTPUT
 
       - name: Download and Process ZIP
@@ -44,7 +51,7 @@ jobs:
           BUILD_NUM="${{ steps.chromium_build.outputs.build_num }}"
           ZIP_URL="https://storage.googleapis.com/chromium-browser-snapshots/Android_Arm64/${BUILD_NUM}/chrome-android.zip"
           
-          echo "⬇️ 正在下载构建号为 ${BUILD_NUM} 的 ZIP 包..."
+          echo "⬇️ 正在下载构建号为 ${BUILD_NUM} 的全新 ZIP 包..."
           curl -L -o "chrome-android.zip" "$ZIP_URL"
           
           echo "📦 正在解压..."
@@ -56,26 +63,24 @@ jobs:
             exit 1
           fi
           
-          # 提取临时存放
           mv "$TARGET_APK" "temp_target.apk"
-          echo "✅ 成功提取 APK"
+          echo "✅ 成功提取临时的 ChromePublic.apk"
 
       - name: Parse Real Version with aapt
         id: parse_version
         run: |
-          echo "📱 正在使用 aapt 解析 APK 内部的真实版本号..."
-          # 解析 versionName，类似 151.0.7896.3
+          echo "📱 正在使用 aapt 解析 APK 内部的真实显示版本号..."
           REAL_VERSION=$(aapt dump badging temp_target.apk | grep "versionName" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
           
           if [ -z "$REAL_VERSION" ]; then
-            echo "⚠️ aapt 提取失败，使用构建号作为回退"
+            echo "⚠️ aapt 提取失败，回退到构建号命名"
             REAL_VERSION="0.0.${{ steps.chromium_build.outputs.build_num }}"
           fi
           
           echo "✨ 提取出真实版本号: ${REAL_VERSION}"
           echo "real_version=${REAL_VERSION}" >> $GITHUB_OUTPUT
           
-          # 移动并规范命名
+          # 重命名为标准的、能在前端正确排序的版本号格式
           mv temp_target.apk "chromium-${REAL_VERSION}.apk"
 
       - name: Check if Version Already Released
@@ -83,10 +88,10 @@ jobs:
         run: |
           VERSION="${{ steps.parse_version.outputs.real_version }}"
           if gh release view "v${VERSION}" --repo ${{ github.repository }} &>/dev/null; then
-            echo "⏭️ 版本 v${VERSION} 已存在，跳过发布。"
+            echo "⏭️ 版本 v${VERSION} 已存在，跳过本次发布。"
             echo "should_upload=false" >> $GITHUB_OUTPUT
           else
-            echo "✅ 发现新版本 v${VERSION}，准备上传！"
+            echo "✅ 发现全新大版本 v${VERSION}，准备上传！"
             echo "should_upload=true" >> $GITHUB_OUTPUT
           fi
         env:
@@ -98,10 +103,10 @@ jobs:
           VERSION="${{ steps.parse_version.outputs.real_version }}"
           BUILD_NUM="${{ steps.chromium_build.outputs.build_num }}"
           
-          echo "🚀 正在创建 Github Release..."
+          echo "🚀 正在发布最新 v${VERSION} 的 Github Release..."
           gh release create "v${VERSION}" "chromium-${VERSION}.apk" \
             --title "Chromium ${VERSION}" \
-            --notes "自动同步最新版本。内部 Chromium 构建号: ${BUILD_NUM}"
+            --notes "自动同步最新版本。内部构建快照号: ${BUILD_NUM}"
           echo "🎉 Release 发布成功！"
         env:
           GH_TOKEN: ${{ secrets.GH_UPLOAD_TOKEN }}
