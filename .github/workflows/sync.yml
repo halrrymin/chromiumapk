@@ -2,7 +2,7 @@ name: Sync Chromium APK
 
 on:
   schedule:
-    - cron: '0 8 * * *' # 每天早上 8 点运行
+    - cron: '0 8 */2 * *' # 每 2 天早上 8 点触发
   workflow_dispatch:
 
 permissions:
@@ -10,93 +10,99 @@ permissions:
 
 env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE20: true
-  # 请把下方地址改为您部署的那个 Chromium 专门脚本的 Worker 域名（确保能访问到 /json）
-  CHROMIUM_WORKER_URL: "https://你的chromium解析worker.workers.dev/json"
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aapt unzip curl
+          # 确保安装了 aapt 用来解析 APK 的内部版本号
+          sudo apt-get install -y -qq unzip curl aapt
 
-      - name: Fetch Latest Chromium Metadata
-        id: meta
+      - name: Get Latest Build Number from GCS
+        id: chromium_build
         run: |
-          echo "🌐 获取 Chromium 最新元数据..."
-          RESPONSE=$(curl -s "$CHROMIUM_WORKER_URL")
+          echo "🌐 查询 Google GCS 的最新 Android_Arm64 构建号..."
+          XML_DATA=$(curl -s "https://storage.googleapis.com/chromium-browser-snapshots/?prefix=Android_Arm64/&delimiter=/&max-keys=1000")
+          LATEST_BUILD=$(echo "$XML_DATA" | grep -oE 'Android_Arm64/[0-9]+/' | grep -oE '[0-9]+' | sort -n | tail -n 1)
           
-          # 从 JSON 中提取版本号和下载链接
-          VERSION=$(echo "$RESPONSE" | jq -r '.version')
-          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.apkUrl')
+          if [ -z "$LATEST_BUILD" ]; then
+            echo "❌ 无法解析到有效的构建号！"
+            exit 1
+          fi
+          echo "🔥 最新构建号为: $LATEST_BUILD"
+          echo "build_num=$LATEST_BUILD" >> $GITHUB_OUTPUT
+
+      - name: Download and Process ZIP
+        run: |
+          BUILD_NUM="${{ steps.chromium_build.outputs.build_num }}"
+          ZIP_URL="https://storage.googleapis.com/chromium-browser-snapshots/Android_Arm64/${BUILD_NUM}/chrome-android.zip"
           
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "❌ 无法从 Worker 获取有效的版本号"
+          echo "⬇️ 正在下载构建号为 ${BUILD_NUM} 的 ZIP 包..."
+          curl -L -o "chrome-android.zip" "$ZIP_URL"
+          
+          echo "📦 正在解压..."
+          unzip -q "chrome-android.zip"
+          
+          TARGET_APK=$(find . -name "ChromePublic.apk" | head -n 1)
+          if [ -z "$TARGET_APK" ] || [ ! -f "$TARGET_APK" ]; then
+            echo "❌ 未能在解压目录中找到 ChromePublic.apk！"
             exit 1
           fi
           
-          echo "Latest Version: $VERSION"
-          echo "Download URL: $DOWNLOAD_URL"
-          
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+          # 提取临时存放
+          mv "$TARGET_APK" "temp_target.apk"
+          echo "✅ 成功提取 APK"
 
-      - name: Check if version already released
+      - name: Parse Real Version with aapt
+        id: parse_version
+        run: |
+          echo "📱 正在使用 aapt 解析 APK 内部的真实版本号..."
+          # 解析 versionName，类似 151.0.7896.3
+          REAL_VERSION=$(aapt dump badging temp_target.apk | grep "versionName" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          
+          if [ -z "$REAL_VERSION" ]; then
+            echo "⚠️ aapt 提取失败，使用构建号作为回退"
+            REAL_VERSION="0.0.${{ steps.chromium_build.outputs.build_num }}"
+          fi
+          
+          echo "✨ 提取出真实版本号: ${REAL_VERSION}"
+          echo "real_version=${REAL_VERSION}" >> $GITHUB_OUTPUT
+          
+          # 移动并规范命名
+          mv temp_target.apk "chromium-${REAL_VERSION}.apk"
+
+      - name: Check if Version Already Released
         id: check_release
         run: |
-          VERSION="${{ steps.meta.outputs.version }}"
+          VERSION="${{ steps.parse_version.outputs.real_version }}"
           if gh release view "v${VERSION}" --repo ${{ github.repository }} &>/dev/null; then
-            echo "⏭️ 版本 ${VERSION} 已存在，跳过后续步骤"
+            echo "⏭️ 版本 v${VERSION} 已存在，跳过发布。"
             echo "should_upload=false" >> $GITHUB_OUTPUT
           else
-            echo "✅ 发现新版本 ${VERSION}，准备下载"
+            echo "✅ 发现新版本 v${VERSION}，准备上传！"
             echo "should_upload=true" >> $GITHUB_OUTPUT
           fi
         env:
           GH_TOKEN: ${{ secrets.GH_UPLOAD_TOKEN }}
 
-      - name: Download and Process Chromium ZIP
+      - name: Create GitHub Release
         if: steps.check_release.outputs.should_upload == 'true'
         run: |
-          VERSION="${{ steps.meta.outputs.version }}"
-          URL="${{ steps.meta.outputs.download_url }}"
+          VERSION="${{ steps.parse_version.outputs.real_version }}"
+          BUILD_NUM="${{ steps.chromium_build.outputs.build_num }}"
           
-          echo "⬇️ 开始下载 Chromium zip..."
-          curl -L -o chromium.zip "$URL"
-          
-          echo "📦 解压 zip 文件..."
-          unzip -q chromium.zip
-          
-          # Chromium 解压后通常会生成一个叫 android_arm64 或 chrome-android 的目录
-          # 我们在其中寻找主要的 APK 文件（通常叫 ChromePublic.apk 或 Chromium.apk）
-          APK_PATH=$(find . -name "*.apk" | head -n 1)
-          
-          if [ -z "$APK_PATH" ]; then
-            echo "❌ 在解压后的文件中没有找到任何 APK！"
-            exit 1
-          fi
-          
-          echo "✅ 找到 APK 文件: $APK_PATH"
-          mv "$APK_PATH" "chromium-${VERSION}.apk"
-          
-          FILE_SIZE=$(stat -c%s "chromium-${VERSION}.apk" 2>/dev/null || echo 0)
-          echo "✅ 最终 APK 大小：${FILE_SIZE} 字节"
-
-      - name: Upload APK to Github Release
-        if: steps.check_release.outputs.should_upload == 'true'
-        run: |
-          VERSION="${{ steps.meta.outputs.version }}"
-          echo "📦 创建 Release: v${VERSION}"
+          echo "🚀 正在创建 Github Release..."
           gh release create "v${VERSION}" "chromium-${VERSION}.apk" \
             --title "Chromium ${VERSION}" \
-            --notes "自动同步 Chromium 最新快照 - 版本号: ${VERSION}"
-          echo "✅ Release 创建成功"
+            --notes "自动同步最新版本。内部 Chromium 构建号: ${BUILD_NUM}"
+          echo "🎉 Release 发布成功！"
         env:
           GH_TOKEN: ${{ secrets.GH_UPLOAD_TOKEN }}
 
@@ -104,20 +110,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_UPLOAD_TOKEN }}
         run: |
-          echo "🧹 检查是否需要清理旧版本..."
+          echo "🧹 检查历史 Release..."
           ALL_TAGS=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
           TOTAL=$(echo "$ALL_TAGS" | wc -l)
           
           if [ "$TOTAL" -gt 3 ]; then
             KEEP=3
             DELETE_COUNT=$((TOTAL - KEEP))
-            echo "⚠️ 将删除 ${DELETE_COUNT} 个旧版本，保留最新 ${KEEP} 个"
+            echo "⚠️ 保留最新 ${KEEP} 个，删除旧的 ${DELETE_COUNT} 个版本。"
             OLD_TAGS=$(echo "$ALL_TAGS" | tail -n +$((KEEP + 1)))
             for TAG in $OLD_TAGS; do
-              echo "🗑️ 删除旧版本: $TAG"
-              gh release delete "$TAG" --yes --cleanup-tag || echo "删除 $TAG 失败，继续下一个"
+              echo "🗑️ 正在删除旧版本: $TAG"
+              gh release delete "$TAG" --yes --cleanup-tag || echo "删除 $TAG 失败"
             done
-            echo "✅ 清理完成"
-          else
-            echo "✅ 版本数量未超过 3 个，无需清理"
           fi
